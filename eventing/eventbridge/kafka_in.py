@@ -16,6 +16,30 @@ claimed, and the attributes the signature covered would all be gone, leaving a
 signature that can no longer be checked against anything. The original is therefore
 preserved under `data["rejected"]` — attrs, payload, claimed source and signature — so
 an incident can be verified offline rather than merely logged.
+
+**Stored is not the same as acted on (#885).** Marking a refused event was originally the
+whole of enforcement, and it was not enough: the rewrite preserves `final` and `groupid`
+so the record stays readable, which meant a rejected event went on finishing its member,
+settling its batch, and overwriting the verified row at its sequence. With enforcement
+on, a forged terminal could finish a batch as `failed: 1` and the genuine answer that
+followed was discarded as a duplicate — so the forgery did not merely add a lie, it
+destroyed the truth. A rejected envelope is therefore marked with `ce.KEY_REJECTED` and
+reaches no acting path: not `on_group_event`, not `on_member_event`, and not a sequence
+a non-rejected row already holds.
+
+**The guard reads `ok`, never `verified`, and that is load-bearing.** `emit()` signs
+terminal events only, because a signature costs ~222 ms and signing every stdout frame
+would add minutes to a chatty run, so an unsigned non-terminal frame is accepted *by
+policy*. `response_decision` reports those — and a deployment with no keyset — as
+`verified=True`, acceptance by policy rather than a check that passed, which is what
+keeps `accept and not verified` meaning the audit-mode population and nothing else.
+
+So the population to refuse is `not ok`. Keying the guard on `verified` would be wrong
+in both directions: it would spare nothing extra, and it would make audit mode inert,
+where the whole point is that events keep acting while the reject rate is watched.
+Getting this backwards is the §4.4 step 2 mistake — verifying all-or-nothing rewrote
+every streamed frame of every genuine run to `phase="error"`, and it was found against a
+live broker, by no unit test.
 """
 from __future__ import annotations
 
@@ -73,12 +97,36 @@ class Consumer(threading.Thread):
         self._require_sig = require_signature
         self._bridge_kid = bridge_kid
         self._rejected = 0
+        self._audit_failed = 0
+        self._rejected_not_stored = 0
         self._stopping = threading.Event()
 
     @property
     def rejected(self) -> int:
         """Responses stored as phase=error because they did not verify."""
         return self._rejected
+
+    @property
+    def rejected_not_stored(self) -> int:
+        """Rejected responses refused even the `phase=error` row, because a verified
+        row already held their (correlationid, sequence). #885 item 3.
+
+        Separate from `rejected` because it is a different operational fact: the event
+        was refused AND it collided with a genuine answer, which is what an attempt to
+        overwrite a verified result looks like from the store's side.
+        """
+        return self._rejected_not_stored
+
+    @property
+    def audit_failed(self) -> int:
+        """Responses accepted unchanged that enforcement *would* have rejected.
+
+        This is the reject rate the two-flag rollout asks an operator to watch: with a
+        keyset configured and `EB_REQUIRE_RESPONSE_SIGNATURE=false`, it counts what
+        turning enforcement on would start refusing. Stays 0 once enforcement is on,
+        because then those events land in `rejected` instead.
+        """
+        return self._audit_failed
 
     def stop(self) -> None:
         self._stopping.set()
@@ -106,10 +154,10 @@ class Consumer(threading.Thread):
                     # here ends the for, ends the while, and the thread is gone — while
                     # the process stays up and the pod still reports healthy. The
                     # verification path must degrade, never raise.
-                    ok, why = True, "not checked"
+                    ok, why, verified = True, "not checked", True
                     if self._keyset is not None:
                         try:
-                            ok, why = signing.response_decision(
+                            ok, why, verified = signing.response_decision(
                                 evt, self._keyset, require=self._require_sig,
                                 bridge_kid=self._bridge_kid)
                         except Exception as e:  # noqa: BLE001
@@ -117,8 +165,19 @@ class Consumer(threading.Thread):
                             # itself is broken, an unverifiable event is not evidence of
                             # anything, and silently accepting it defeats the control.
                             ok, why = (not self._require_sig), f"verifier raised: {e!r}"
+                            verified = False
                             print(f"[kafka_in] verification error: {e!r}")
                     d = ce.envelope_dict(evt)
+                    if ok and not verified:
+                        # Audit mode: the event is stored unchanged, and this line plus
+                        # the counter are the only trace that enforcement would have
+                        # refused it. §4.4's two-flag rollout ("a keyset alone verifies
+                        # and logs") is unperformable without them -- the verdict was
+                        # computed and the reason discarded, so there was no reject rate
+                        # to watch before turning enforcement on.
+                        self._audit_failed += 1
+                        print(f"[kafka_in] audit: would reject response on "
+                              f"{d.get('correlationid') or d.get('groupid')}: {why}")
                     if not ok:
                         self._rejected += 1
                         print(f"[kafka_in] unverified response on "
@@ -135,6 +194,13 @@ class Consumer(threading.Thread):
                         # destroy the forensic record while the docstring above still
                         # promised it — leaving a signature whose covered attributes no
                         # longer exist, and nothing for an operator to review.
+                        #
+                        # `ce.KEY_REJECTED` is the verdict itself, carried at the top
+                        # level because that is the one thing every acting path receives.
+                        # It is what `insert_response` and the group service read; the
+                        # `data` keys below are for a human reading the transcript, and
+                        # keying a control on them would be keying it on `data`, which
+                        # arrives off the wire intact. See `ce.KEY_REJECTED`.
                         d = dict(d, phase="error", data={
                             "text": f"unverified response rejected: {why}",
                             "signature_rejected": True,
@@ -145,12 +211,21 @@ class Consumer(threading.Thread):
                                          "signature": evt.get("signature"),
                                          "attrs": dict(evt.attrs),
                                          "data": evt.data},
-                        })
+                        }, **{ce.KEY_REJECTED: True})
                     # §21.2: route on type. A group lifecycle event carries `groupid`
                     # but no `correlationid`, so handing it to insert_response would
                     # violate that table's (correlationid, sequence) primary key.
                     if ce.is_group_event(evt):
-                        if self._on_group_event:
+                        # #885 — `ok`, not `verified`. Those are different questions:
+                        # `verified` is False only for a check that FAILED, which audit
+                        # mode accepts on purpose, while `not ok` is the
+                        # enforcement-refused population and the only one to skip. See
+                        # the module docstring.
+                        #
+                        # The group service refuses a marked envelope too (§885's single
+                        # rule), so this is the source-side half of a rule enforced at
+                        # both ends rather than the only guard.
+                        if self._on_group_event and ok:
                             try: self._on_group_event(d)
                             except Exception as e: print(f"[kafka_in] group event: {e!r}")
                     else:
@@ -162,8 +237,18 @@ class Consumer(threading.Thread):
                         # indistinguishable from an agent that never answered).
                         target = (self._stores.for_event(evt) if self._stores
                                   else self._store)
-                        target.insert_response(d)
-                        if self._on_member_event and d.get("groupid"):
+                        if not target.insert_response(d):
+                            # #885 item 3 — the row at this sequence was NOT a rejection,
+                            # so a rejected frame was refused the overwrite. Counted and
+                            # logged rather than dropped silently: §4.4's rule is that a
+                            # drop is indistinguishable from an agent that never
+                            # answered. The verified row it failed to replace is the
+                            # better record of what happened at this sequence.
+                            self._rejected_not_stored += 1
+                            print(f"[kafka_in] rejected response for "
+                                  f"{d.get('correlationid')} seq {d.get('sequence')} "
+                                  f"not stored: a verified row holds that sequence")
+                        if self._on_member_event and d.get("groupid") and ok:
                             try: self._on_member_event(d)
                             except Exception as e: print(f"[kafka_in] member event: {e!r}")
                     if self._on_event:

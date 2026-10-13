@@ -172,7 +172,7 @@ Highlights, each re-measuring something the design had asserted:
 | Concurrency (T1.10) | ≤ partition count | peak **4** replicas for 3 correlations |
 | Image pull | 5.1 s cold (245 MB) | 454 ms – 2.45 s warm |
 | Rebalance floor (Gap A) | ~3 s | consistent with the 5.0 s total |
-| Ed25519 sign / verify | not estimated | **222 ms / 227 ms** — see §6 |
+| Ed25519 sign / verify | not estimated | **222 ms / 227 ms** — see §9 |
 
 ---
 
@@ -812,9 +812,14 @@ That is RQ-1 behaving exactly as designed, observed by accident.
   tested against the RFC vectors and the flag is wired through `consume.py`, but no
   publisher signs requests yet, so the verify-and-reject path has not been
   exercised on a cluster. EventBridge does not sign.
-  *(Resolved in Phase 2: EventBridge signs requests and group events, EventRunner
-  signs terminal responses, and both verify against the approved-key set. The
-  reject paths now have tests. See `DESIGN_PHASE2.md` §4.)*
+  *(Superseded twice. **Phase 2**: EventBridge signs requests and group events,
+  EventRunner signs terminal responses, and both verify against the approved-key set —
+  the reject paths have tests. See `DESIGN_PHASE2.md` §4. **#896**:
+  `k8s_demo_flow.py --overlay kind-signed` now drives the signed path and asserts a
+  forgery is refused, so the gap is a script that exists rather than one that does not.
+  What remains unclosed is the run itself: as of 2026-10-12 **nobody has executed it
+  against a cluster**, so there is still no measured on-cluster figure for signing cost
+  or for the wake latency that includes it. Do not quote one until there is.)*
 - **Resource requests and limits are still placeholders** (§18). A real run has
   not produced numbers.
 - **Single-broker, ephemeral storage.** A broker restart loses all topic data, and

@@ -6,6 +6,7 @@ a redelivered request re-runs the agent and emits a second terminal event, and a
 counter would then reach zero while agents were still running — firing "all done"
 early, which is the one lie a progress display must never tell.
 """
+import binascii
 import datetime as dt
 import io
 import json
@@ -19,7 +20,8 @@ from eventbridge.group_view import render
 from eventbridge.groups import MIN_FINISHED_FOR_ETA, completion_reason, humanize, progress, summary_line
 from eventbridge.handlers import Handlers
 from eventbridge.store import Store
-from shared import ce
+from shared import ce, keyset
+from shared import signing as S
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -62,10 +64,15 @@ def svc(tmp_path):
     return GroupService(cfg, store, producer, SeqMinter()), store, producer, cfg
 
 
-def member_event(groupid, corr, *, final=False, phase="stdout", text="hi", seq=1):
-    return {"correlationid": corr, "groupid": groupid, "sequence": seq,
-            "phase": phase, "final": "true" if final else "false",
-            "data": {"text": text, "role": "final" if final else "assistant"}}
+def member_event(groupid, corr, *, final=False, phase="stdout", text="hi", seq=1,
+                 userkey=None):
+    e = {"correlationid": corr, "groupid": groupid, "sequence": seq,
+         "phase": phase, "final": "true" if final else "false",
+         "data": {"text": text, "role": "final" if final else "assistant"}}
+    if userkey:
+        from shared import ce
+        e[ce.EXT_USERKEY] = userkey
+    return e
 
 
 # ---- the wire ---------------------------------------------------------------
@@ -401,13 +408,18 @@ def test_a_finished_group_does_not_poll():
 # ---- ntfy: announce the edges, suppress the middle -------------------------
 
 class RecordingNtfy:
-    """NtfyPublisher with the network replaced, so submit/suppress logic is testable."""
+    """NtfyPublisher with the network replaced, so submit/suppress logic is testable.
 
-    def __init__(self, store, notify_errors=False):
+    `stores=` is the multi-tenant registry passthrough: without it the fixture can
+    only exercise the single-store path, and the suppression verdict is now "is there
+    a `group_members` row in the store this event ROUTED to" — which a single store
+    can never distinguish from "the only store"."""
+
+    def __init__(self, store, notify_errors=False, stores=None):
         from eventbridge.config import NtfyCfg
         from eventbridge.ntfy import NtfyPublisher
         cfg = NtfyCfg(enabled=True, topic="t", group_notify_errors=notify_errors)
-        self.pub = NtfyPublisher(cfg, "http://eb.test", store=store)
+        self.pub = NtfyPublisher(cfg, "http://eb.test", store=store, stores=stores)
         self.sent = []
         self.pub._post = lambda payload: self.sent.append(payload)
 
@@ -452,6 +464,13 @@ def test_a_redelivered_member_event_after_completion_still_does_not_notify(svc):
     completes: KEDA scales a pod down, its offset was never committed, Kafka redelivers
     the request and the agent re-runs. Suppression keyed on "group still open" let every
     one of those through. Membership is the correct key.
+
+    A redelivery is always a RECORDED member: both submission paths call
+    `add_group_member` before publishing the request, precisely so a fast agent's
+    terminal event can be attributed, and `on_member_event` records membership again on
+    arrival -- ahead of the ntfy fan-out, which `kafka_in.run()` invokes afterwards. So
+    reading membership from the store rather than from `ce_groupid` suppresses
+    redeliveries exactly as before.
     """
     s, store, _, _ = svc
     gid, _ = s.create(label="batch", expected=1)
@@ -461,8 +480,14 @@ def test_a_redelivered_member_event_after_completion_still_does_not_notify(svc):
 
     n = RecordingNtfy(store)
     n.submit_and_drain(member_event(gid, corr, final=True, phase="result"))
-    n.submit_and_drain(member_event(gid, "late-agent-0009", final=True, phase="result"))
     assert n.sent == [], "a batch is two notifications, not two plus its redeliveries"
+
+    # A correlation id that is NOT a recorded member but claims the group is a different
+    # case, and deliberately notifies now -- see
+    # test_a_member_event_that_only_claims_a_group_is_not_trusted_as_a_member.
+    n.submit_and_drain(member_event(gid, "late-agent-0009", final=True, phase="result"))
+    assert len(n.sent) == 1, \
+        "an unrecorded correlation id is not silenced by the groupid it asserts"
 
 
 def test_a_hundred_members_produce_exactly_two_notifications(svc):
@@ -491,6 +516,106 @@ def test_an_ungrouped_agent_still_notifies(svc):
     n.submit_and_drain({"correlationid": "solo", "phase": "result", "final": "true",
                         "data": {"text": "hi"}})
     assert len(n.sent) == 1
+
+
+def test_a_member_event_without_a_groupid_is_still_suppressed(svc):
+    """The forger controls every attribute on the event -- including by leaving it out.
+
+    Suppression used to read `ce_groupid` off the event, so a frame that simply OMITTED
+    it was not a group member as far as the check was concerned: it was pushed, stored
+    in the member's transcript and shown on the group page. `DESIGN_PHASE2.md` §8.5.4
+    states the rule this is an instance of -- prefer deciding on state the attacker does
+    not supply: group membership from the store, not the groupid on the frame.
+
+    Reachable even with signing fully enforced, because this is a routing decision on
+    an attacker-supplied attribute, not a signature check.
+    """
+    s, store, _, _ = svc
+    gid, _ = s.create(label="batch", expected=2)
+    corr = s.submit_members(gid, ["a"])[0]
+
+    forged = member_event(gid, corr, final=True, phase="result")
+    del forged["groupid"]
+
+    n = RecordingNtfy(store)
+    n.submit_and_drain(forged)
+    assert n.sent == [], "membership comes from group_members, not from the frame"
+
+
+def test_a_forged_terminal_frame_without_a_groupid_does_not_page(svc):
+    """The sharper edge of the same hole: a terminal frame reaches `_publish` as an
+    error, which pages at priority 5 even with NTFY_GROUP_NOTIFY_ERRORS off -- and does
+    not count the member as failed, so the batch's own arithmetic disagreed with the
+    notification the operator had just received."""
+    s, store, _, _ = svc
+    gid, _ = s.create(label="batch", expected=2)
+    corr = s.submit_members(gid, ["a"])[0]
+
+    forged = member_event(gid, corr, final=True, phase="error")
+    del forged["groupid"]
+
+    n = RecordingNtfy(store, notify_errors=False)
+    n.submit_and_drain(forged)
+    assert n.sent == [], "a member's error must stay suppressed while errors are off"
+
+
+def test_a_member_event_that_only_claims_a_group_is_not_trusted_as_a_member(svc):
+    """The converse, and the reason the fix is not simply "read both".
+
+    An event asserting a `ce_groupid` it is not a recorded member of must not be able to
+    silence itself by that assertion. Legitimate members are always recorded first --
+    both submission paths call `add_group_member` before publishing -- so only a forgery
+    reaches here unrecorded.
+    """
+    s, store, _, _ = svc
+    gid, _ = s.create(label="batch", expected=2)
+    s.submit_members(gid, ["a"])
+
+    n = RecordingNtfy(store)
+    n.submit_and_drain(member_event(gid, "never-submitted-0001",
+                                    final=True, phase="result"))
+    assert len(n.sent) == 1, "the groupid on the frame cannot buy silence"
+
+
+@pytest.mark.xfail(strict=True, reason="#904: in multi-tenant mode the store this "
+                                      "lookup routes to is chosen by ce_userkey")
+def test_a_forged_frame_cannot_change_stores_to_escape_suppression(svc, tmp_path):
+    """The multi-tenant member of the omission class, currently open.
+
+    The verdict is "is there a `group_members` row for this corr in the store this
+    event ROUTED to", and in multi-tenant mode the routing is `ce_userkey` — an
+    attribute the forger controls exactly as they controlled `ce_groupid`. A frame
+    that keeps `ce_groupid` but omits `ce_userkey` routes to `shared/`, where the
+    membership row is not, and escapes suppression: it is pushed, and a terminal
+    `phase=error` frame pages at priority 5 with errors off.
+
+    Both sides go through one registry, so the membership row IS in the per-user
+    store the frame with its `ce_userkey` intact would route to — the only thing
+    standing between the stripped frame and suppression is the routing itself.
+
+    Pre-existing (the old code called `_store_for` too), closed for single-tenant by
+    this PR, and tracked as #904 — where the fix is to resolve the store from the
+    ownership index, which the forger does not supply. This test is
+    `xfail(strict=True)` so it records the hole and flips to a pass the moment the
+    fix lands."""
+    from eventbridge.group_service import GroupService
+    from eventbridge.store_registry import StoreRegistry
+
+    _, _, producer, cfg = svc
+    reg = StoreRegistry(tmp_path, multi=True)
+    s = GroupService(cfg, None, producer, SeqMinter(), stores=reg)
+    gid, _ = s.create(label="batch", expected=2, userkey="gh-alice-a1b2c3d4")
+    corr = s.submit_members(gid, ["a"], userkey="gh-alice-a1b2c3d4")[0]
+
+    forged = member_event(gid, corr, final=True, phase="result",
+                          userkey="gh-alice-a1b2c3d4")
+    # The row is where the intact frame would look for it:
+    assert reg.for_event(forged).group_of(corr) is not None
+    del forged["userkey"]          # -> shared/, where the membership row is not
+
+    n = RecordingNtfy(None, stores=reg)
+    n.submit_and_drain(forged)
+    assert n.sent == [], "dropping ce_userkey must not buy a push either"
 
 
 def test_member_errors_can_be_surfaced_by_config(svc):
@@ -960,11 +1085,11 @@ def _record(event_dict, offset):
     return _FakeRec(headers, value, offset)
 
 
-def _mirror_over(records_by_partition, groups, monkeypatch, **kw):
+def _mirror_over(records_by_partition, groups, monkeypatch, *, mirror_kw=None, **kw):
     from eventbridge import kafka_group_mirror as mod
     fake = _FakeConsumer(records_by_partition, **kw)
     monkeypatch.setattr(mod, "KafkaConsumer", lambda **_: fake)
-    m = mod.GroupMirror("broker:9092", "responses", groups)
+    m = mod.GroupMirror("broker:9092", "responses", groups, **(mirror_kw or {}))
     m.run()          # synchronous: the scan is one-shot by design
     return m, fake
 
@@ -1125,3 +1250,322 @@ def test_a_broker_that_is_down_does_not_block_startup(svc, monkeypatch):
 
     monkeypatch.setattr(mod, "KafkaConsumer", _boom)
     mod.GroupMirror("broker:9092", "responses", fresh).run()   # must not raise
+
+
+# ---- a rejected event is evidence, not a fact (#885) ------------------------
+#
+# The guard these pin keys on `ce.KEY_REJECTED` and nothing else. The first test is the
+# reason: `phase="error"` is a value genuine agent failures carry, so a guard written the
+# obvious way — refusing to act on `phase == "error"` — breaks every real failure instead
+# of the forgeries. It is written first and it passes both before and after the fix.
+
+def test_a_genuine_error_phase_terminal_still_fails_its_member(svc):
+    """The false positive the #885 guard must not have.
+
+    `eventrunner/runner.py` emits `phase="error", final=True` when an agent exits
+    non-zero or dies without a result frame, and `mark_member_finished` maps that to
+    status `failed`. If the guard keyed on `phase` rather than on the rejection marker,
+    a genuinely failed agent would never finish its member: the batch would sit at
+    "1 running" until the deadline sweep, which §21.6 names as the worst outcome
+    because it fails as silence.
+    """
+    s, store, producer, _ = svc
+    gid, _ = s.create(label="one-fails", expected=1)
+    corr, = s.submit_members(gid, ["do a thing"])
+    s.on_member_event(member_event(gid, corr, final=True, phase="error",
+                                   text="claude exited with code 1"))
+    members = store.group_members(gid)
+    assert members[0]["status"] == "failed", \
+        "a genuine error terminal must still finish its member, as a failure"
+    assert store.group_counts(gid)["terminal"] == 1
+    assert store.get_group(gid)["completed_utc"] is not None, \
+        "and the batch must still complete rather than hang to its deadline"
+    completions = [e for e in producer.group_events
+                   if e["type"] == ce.TYPE_GROUP_COMPLETED]
+    assert len(completions) == 1
+    assert completions[0]["data"]["failed"] == 1
+
+
+def test_a_rejected_member_event_does_not_finish_a_member(svc):
+    """§8.5.1, followed to the outcome: the verdict has to stop the state change.
+
+    A rejected terminal that reaches `mark_member_finished` wins the `finished_utc IS
+    NULL` race, so the member is finished — as a failure, because the rewrite carries
+    `phase="error"` — and the genuine answer arriving afterwards is discarded by the
+    duplicate guard. The forgery does not just add a lie; it destroys the truth.
+    """
+    s, store, producer, _ = svc
+    gid, _ = s.create(label="forged", expected=1)
+    corr, = s.submit_members(gid, ["do a thing"])
+    forged = member_event(gid, corr, final=True, phase="error",
+                          text="unverified response rejected: no ce_signature")
+    forged[ce.KEY_REJECTED] = True
+    s.on_member_event(forged)
+    members = store.group_members(gid)
+    assert members[0]["status"] != "finished", \
+        "a rejected event must not finish a member"
+    assert members[0]["status"] != "failed", \
+        "nor fail one — it is not evidence about the agent at all"
+    assert store.group_counts(gid)["terminal"] == 0
+    assert store.get_group(gid)["completed_utc"] is None, \
+        "and must not settle the batch"
+    assert [e for e in producer.group_events
+            if e["type"] == ce.TYPE_GROUP_COMPLETED] == []
+
+
+def test_the_genuine_answer_still_completes_the_batch_after_a_rejected_one(svc):
+    """The harm in #885's item 1, end to end: the real answer must survive.
+
+    Reproduced in the issue as `0 finished, 1 failed` followed by `duplicate terminal
+    event ignored` — the batch reporting a failure that did not occur while the genuine
+    answer was dropped on the floor.
+    """
+    s, store, producer, _ = svc
+    gid, _ = s.create(label="forged-then-real", expected=1)
+    corr, = s.submit_members(gid, ["what is 2+2"])
+    forged = member_event(gid, corr, final=True, phase="error", text="Ship the goods")
+    forged[ce.KEY_REJECTED] = True
+    s.on_member_event(forged)
+    s.on_member_event(member_event(gid, corr, final=True, phase="result",
+                                   text="2+2 is 4", seq=2))
+    members = store.group_members(gid)
+    assert members[0]["status"] == "finished", \
+        "the genuine answer must still be the one that finishes the member"
+    assert members[0]["terminal_phase"] == "result"
+    counts = store.group_counts(gid)
+    assert counts["finished"] == 1 and counts["failed"] == 0, \
+        "the batch must not report a failure that never happened"
+    completions = [e for e in producer.group_events
+                   if e["type"] == ce.TYPE_GROUP_COMPLETED]
+    assert len(completions) == 1, "and must complete exactly once"
+    assert completions[0]["data"]["failed"] == 0
+
+
+def test_a_rejected_group_completed_event_does_not_settle_a_group(svc):
+    """#885 item 2: `on_group_event` reads only `type` and `groupid`, both of which the
+    rejection rewrite deliberately preserves so the forensic record stays readable."""
+    s, store, _producer, _ = svc
+    gid, _ = s.create(label="open", expected=2)
+    s.submit_members(gid, ["a", "b"])
+    s.on_group_event({"type": ce.TYPE_GROUP_COMPLETED, "groupid": gid,
+                      "data": {"reason": "all"}, ce.KEY_REJECTED: True})
+    assert store.get_group(gid)["completed_utc"] is None, \
+        "a forged completion must not end a batch early"
+
+
+def test_a_rejected_group_started_event_does_not_create_a_group(svc):
+    """The `create_group` half, which is the state change easy to forget: a group row
+    with a forged label and expected count is still a state change, and `expected` is
+    the denominator every progress figure is computed against."""
+    s, store, _producer, _ = svc
+    s.on_group_event({"type": ce.TYPE_GROUP_STARTED, "groupid": "forged-group-0001",
+                      "data": {"label": "injected", "expected": 99},
+                      ce.KEY_REJECTED: True})
+    assert store.get_group("forged-group-0001") is None, \
+        "a rejected started event must not create a group"
+
+
+# ---- the mirror is a second acting path (#885) -------------------------------
+#
+# A forged `group.completed` refused by the live consumer stays on the topic, and the
+# mirror replays the topic on every start. So the consumer-side guard closed the hole
+# only until the pod bounced. The mirror verifies `group.completed` and nothing else,
+# because it also exists to replay history published before signing did.
+
+_MIRROR_SEED_EB = binascii.unhexlify(
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+_MIRROR_SEED_R1 = binascii.unhexlify(
+    "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
+
+
+def _mirror_keyset():
+    return keyset.KeySet({"eb-01": S.public_key(_MIRROR_SEED_EB),
+                          "runner-01": S.public_key(_MIRROR_SEED_R1)})
+
+
+def _signed_completion(gid, *, seed, kid):
+    evt = ce.new_event(type=ce.TYPE_GROUP_COMPLETED, source="/eb", groupid=gid,
+                       datacontenttype="application/json",
+                       data={"reason": "all", "finished": 2, "failed": 0})
+    S.sign_into(evt, seed, kid)
+    headers, value = ce.to_kafka_binary(evt)
+    return _FakeRec(headers, value, 0)
+
+
+def _restarted(cfg, name):
+    store = Store(pathlib.Path(cfg.tmpdir) / name)
+    prod = FakeProducer()
+    return GroupService(cfg, store, prod, SeqMinter()), store, prod
+
+
+def test_the_mirror_refuses_a_group_completed_it_cannot_attribute_to_the_bridge(
+        svc, monkeypatch):
+    """#885 item 2's second half. runner-01 is approved — it is just not the bridge,
+    and `EB_SIGNING_KID` is documented as the only kid accepted on group lifecycle
+    events. Without this the forgery is refused live and applied on the next restart.
+    """
+    _s, _store, _producer, cfg = svc
+    fresh, fresh_store, _fresh_prod = _restarted(cfg, "eb-refuse")
+    rec = _signed_completion("g-forged-0001", seed=_MIRROR_SEED_R1, kid="runner-01")
+    m, _ = _mirror_over({0: [rec]}, fresh, monkeypatch,
+                        mirror_kw={"keyset": _mirror_keyset(), "bridge_kid": "eb-01"})
+    assert m.refused == 1, "the refusal must be counted"
+    assert fresh_store.get_group("g-forged-0001") is None, \
+        "a replayed completion signed by a non-bridge key must not settle anything"
+
+
+def test_the_mirror_applies_a_group_completed_signed_by_the_bridge(svc, monkeypatch):
+    """The positive case: verification must not break the thing the mirror is for."""
+    _s, _store, _producer, cfg = svc
+    fresh, fresh_store, _fresh_prod = _restarted(cfg, "eb-accept")
+    gid = "g-genuine-0001"
+    fresh_store.create_group(gid, label="b", expected=2, min_success=None,
+                             deadline_utc=None)
+    rec = _signed_completion(gid, seed=_MIRROR_SEED_EB, kid="eb-01")
+    m, _ = _mirror_over({0: [rec]}, fresh, monkeypatch,
+                        mirror_kw={"keyset": _mirror_keyset(), "bridge_kid": "eb-01"})
+    assert m.refused == 0
+    assert fresh_store.get_group(gid)["completed_utc"] is not None, \
+        "a completion signed by the bridge must still settle its group"
+
+
+def test_the_mirror_still_replays_unsigned_pre_phase_two_history(svc, monkeypatch):
+    """**The risk that matters more than the hole.**
+
+    The mirror runs on every start and the test/kind overlays keep /data on an
+    `emptyDir`, so if enforcement made it refuse unsigned records, every restart would
+    lose every group's state — the exact failure this module was written to prevent,
+    reintroduced in the name of security. Member events and `group.started` are
+    therefore never verified.
+    """
+    _s, _store, _producer, cfg = svc
+    fresh, fresh_store, _fresh_prod = _restarted(cfg, "eb-history")
+    gid = "g-legacy-0001"
+    started = _record({"type": ce.TYPE_GROUP_STARTED, "source": "/eb", "groupid": gid,
+                       "datacontenttype": "application/json",
+                       "data": {"label": "legacy", "expected": 1}}, 0)
+    member = _record({"type": ce.TYPE_RESPONSE, "source": "/er",
+                      "datacontenttype": "application/json",
+                      "correlationid": "test-agent-9001", "groupid": gid,
+                      "sequence": "1", "phase": "result", "final": "true",
+                      "data": {"text": "done"}}, 1)
+    m, _ = _mirror_over({0: [started, member]}, fresh, monkeypatch,
+                        mirror_kw={"keyset": _mirror_keyset(), "bridge_kid": "eb-01"})
+    assert m.refused == 0, "unsigned history is not a forgery"
+    row = fresh_store.get_group(gid)
+    assert row is not None and row["label"] == "legacy", \
+        "an unsigned group.started must still rebuild its group"
+    assert fresh_store.group_counts(gid)["terminal"] == 1, \
+        "and unsigned member events must still rebuild membership"
+
+
+def test_the_mirror_verifies_nothing_when_no_keyset_is_configured(svc, monkeypatch):
+    """The default, per §8.5.2: with no keyset the mirror behaves exactly as before,
+    which is what every unsigned deployment runs."""
+    _s, _store, _producer, cfg = svc
+    fresh, fresh_store, _fresh_prod = _restarted(cfg, "eb-nokeyset")
+    gid = "g-nokeyset-0001"
+    fresh_store.create_group(gid, label="b", expected=1, min_success=None,
+                             deadline_utc=None)
+    rec = _signed_completion(gid, seed=_MIRROR_SEED_R1, kid="runner-01")
+    m, _ = _mirror_over({0: [rec]}, fresh, monkeypatch)
+    assert m.refused == 0
+    assert fresh_store.get_group(gid)["completed_utc"] is not None, \
+        "with verification off, replay is unchanged"
+
+
+# ---- a verified terminal outranks an unverified one on replay (#956) --------
+#
+# The residual of #885 the live-path guard cannot reach: the mirror reads the TOPIC, so
+# the rejection marker the consumer writes into SQLite is not available to it, and the
+# mirror does not rebuild response rows either — so the `rejected` column cannot answer
+# the question on an emptyDir restart. Precedence is what is left, and it is enough
+# because the upgrade is one-way.
+
+def _replay_terminal(gid, corr, text, phase, seq, *, verified=False):
+    e = member_event(gid, corr, final=True, phase=phase, text=text, seq=seq)
+    if verified:
+        e[ce.KEY_REPLAY_VERIFIED] = True
+    return e
+
+
+def test_a_verified_terminal_outranks_a_forged_one_earlier_in_the_topic(svc):
+    """#956. A forged terminal lying earlier in the topic than the genuine answer won
+    `finished_utc IS NULL` on every start, so the batch read back `failed: 1` for an
+    agent that had succeeded — and on the test/kind overlays /data is an `emptyDir`, so
+    that replay IS the state rather than a transient.
+    """
+    s, store, _producer, _ = svc
+    gid, corr = "test-group-0001", "test-agent-0001"
+    store.create_group(gid, label="b", expected=1, min_success=None, deadline_utc=None)
+    s.on_member_event(_replay_terminal(gid, corr, "Ship the goods", "error", 7),
+                      replay=True)
+    s.on_member_event(_replay_terminal(gid, corr, "Q1 flat", "result", 8, verified=True),
+                      replay=True)
+    m = store.group_members(gid)[0]
+    assert m["status"] == "finished", \
+        "the verified answer must outrank the forgery whatever order the topic holds"
+    assert m["terminal_phase"] == "result"
+    assert store.group_counts(gid)["failed"] == 0, \
+        "and the batch must not report a failure that never happened"
+
+
+def test_a_forged_terminal_cannot_downgrade_a_verified_one(svc):
+    """The direction that must NOT work, which is what makes precedence safe: the
+    upgrade is one-way, so moving a member needs a valid signature from an approved
+    key — exactly what a forger does not have."""
+    s, store, _producer, _ = svc
+    gid, corr = "test-group-0002", "test-agent-0002"
+    store.create_group(gid, label="b", expected=1, min_success=None, deadline_utc=None)
+    s.on_member_event(_replay_terminal(gid, corr, "Q1 flat", "result", 7, verified=True),
+                      replay=True)
+    s.on_member_event(_replay_terminal(gid, corr, "Ship the goods", "error", 8),
+                      replay=True)
+    m = store.group_members(gid)[0]
+    assert m["status"] == "finished" and m["terminal_phase"] == "result", \
+        "an unverified terminal must never downgrade a verified one"
+
+
+def test_unsigned_history_replays_exactly_as_before(svc):
+    """**The risk that matters more than the bug.** A forged unsigned terminal and a
+    genuine pre-signing one are byte-identical, so nothing can be refused on replay
+    without refusing the history the mirror exists to rebuild. With no verified
+    terminal in the topic, nothing upgrades and the replay is unchanged."""
+    s, store, _producer, _ = svc
+    gid, corr = "test-group-0003", "test-agent-0003"
+    store.create_group(gid, label="b", expected=1, min_success=None, deadline_utc=None)
+    s.on_member_event(_replay_terminal(gid, corr, "legacy answer", "result", 1),
+                      replay=True)
+    m = store.group_members(gid)[0]
+    assert m["status"] == "finished" and m["terminal_phase"] == "result", \
+        "pre-signing history must still rebuild"
+    assert store.group_counts(gid)["terminal"] == 1
+
+
+def test_a_genuine_failure_still_reads_as_failed_on_replay(svc):
+    """The false positive to avoid: a real agent failure is an unverified-looking
+    `phase=error` terminal with no genuine answer after it, and it must stay `failed`.
+    Upgrading only happens when a VERIFIED terminal actually arrives."""
+    s, store, _producer, _ = svc
+    gid, corr = "test-group-0004", "test-agent-0004"
+    store.create_group(gid, label="b", expected=1, min_success=None, deadline_utc=None)
+    s.on_member_event(_replay_terminal(gid, corr, "claude exited with code 1",
+                                       "error", 3), replay=True)
+    m = store.group_members(gid)[0]
+    assert m["status"] == "failed", "a genuine failure must not be hidden"
+    assert store.group_counts(gid)["failed"] == 1
+
+
+def test_the_replay_verdict_cannot_arrive_from_the_wire(svc):
+    """Same invariant as #885's marker, for the same reason: a verdict this process
+    computed must not be something a publisher can assert."""
+    e = ce.new_event(type=ce.TYPE_RESPONSE, source="s",
+                     datacontenttype="application/json", correlationid="c1",
+                     sequence=1, phase="result", final="true", groupid="g1",
+                     data={"text": "x"})
+    e.attrs[ce.KEY_REPLAY_VERIFIED] = "true"
+    headers, value = ce.to_kafka_binary(e)
+    assert not [k for k, _ in headers if "__" in k]
+    back = ce.from_kafka_binary(headers, value)
+    assert not back.get(ce.KEY_REPLAY_VERIFIED), \
+        "a replay verdict must not be forgeable on the wire"

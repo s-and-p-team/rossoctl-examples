@@ -143,6 +143,17 @@ class GroupService:
         corr = event.get("correlationid")
         if not groupid or not corr:
             return
+        # #885 — a rejected envelope is evidence, not a fact. Before `add_group_member`,
+        # because a membership row is itself a state change: it makes an unknown
+        # correlation a member of this batch and moves `members_seen`, which `progress`
+        # and `completion_reason` both read.
+        #
+        # Without this, a forged terminal wins `mark_member_finished`'s `finished_utc IS
+        # NULL` race and the genuine answer that follows is swallowed by the duplicate
+        # guard below — so the forgery does not merely add a lie, it destroys the truth.
+        if ce.is_rejected(event):
+            _log(f"rejected event for {groupid}/{corr} not counted")
+            return
         # §6.1: the store is chosen by the event's own `userkey`, which is signed (§2.6)
         # and therefore not rewritable in flight. Routing by the event rather than by any
         # ambient state is what keeps one tenant's batch progress out of another's store.
@@ -155,9 +166,22 @@ class GroupService:
         if not final:
             store.mark_member_running(groupid, corr)
             return
-        first = store.mark_member_finished(groupid, corr,
-                                           event.get("phase") or "result")
+        phase = event.get("phase") or "result"
+        # #956 — the mirror sets this on a replayed terminal whose signature checked out.
+        # Absent on the live path (where a failed verification is already inert, #885)
+        # and in every unsigned deployment, so the default is the truthful "nothing has
+        # been proved about this row".
+        verified = bool(event.get(ce.KEY_REPLAY_VERIFIED))
+        first = store.mark_member_finished(groupid, corr, phase, verified=verified)
         if replay:
+            # #956 — ordering on the topic must not decide which terminal wins. If this
+            # one verifies and the recorded one did not, it outranks it; otherwise
+            # nothing moves. One-way, so a forger cannot use it to overwrite a genuine
+            # answer — that would need a valid signature from an approved key.
+            if not first and verified and store.upgrade_member_terminal(
+                    groupid, corr, phase):
+                _log(f"replay: a verified terminal for {groupid}/{corr} "
+                     f"outranks the unverified one on record")
             return
         if not first:
             # A redelivered terminal event. Counting it again is exactly the bug §21.5
@@ -176,6 +200,13 @@ class GroupService:
         """
         groupid = event.get("groupid")
         if not groupid:
+            return
+        # #885 — before `create_group` as well as before `complete_group`. A forged
+        # `started` is not harmless noise: `expected` is the denominator every progress
+        # figure divides by, and a forged `completed` ends a batch early and fires a
+        # "finished" notification for work that never ran.
+        if ce.is_rejected(event):
+            _log(f"rejected group event for {groupid} not applied")
             return
         data = event.get("data") or {}
         store = self._store_for(event.get(ce.EXT_USERKEY))

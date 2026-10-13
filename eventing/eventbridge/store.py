@@ -7,6 +7,8 @@ import sqlite3
 import threading
 from typing import Any
 
+from shared import ce
+
 _SCHEMA_RESPONSES = """
 CREATE TABLE IF NOT EXISTS responses (
   correlationid TEXT NOT NULL,
@@ -17,6 +19,12 @@ CREATE TABLE IF NOT EXISTS responses (
   data_json     TEXT NOT NULL,
   final         INTEGER NOT NULL DEFAULT 0,
   raw_json      TEXT NOT NULL,
+  -- #885 — this row is a refused event kept for review, not an answer. The flag is
+  -- `rejected` rather than `verified` on purpose: 0 is the truthful default for every
+  -- row written before this column existed and for every row written with verification
+  -- off. A `verified` column would default to "unverified" and anything keying on it
+  -- would start refusing ordinary traffic.
+  rejected      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (correlationid, sequence)
 );
 CREATE INDEX IF NOT EXISTS responses_by_corr ON responses(correlationid);
@@ -71,6 +79,11 @@ CREATE TABLE IF NOT EXISTS group_members (
   first_event_utc TEXT,
   finished_utc    TEXT,
   terminal_phase  TEXT,             -- result | error
+  -- #956 — was the terminal that set `status` carried by a VERIFIED event? Defaults to
+  -- 0, which is truthful for every row written before this column and for every
+  -- unsigned deployment: nothing has been proved about them. Only ever moves 0 -> 1
+  -- (`upgrade_member_terminal`), so it cannot be used to downgrade a genuine answer.
+  verified        INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (groupid, correlationid)
 );
 -- What lets the responses consumer answer "does this event belong to a group?" with a
@@ -109,23 +122,68 @@ class Store:
             self._s.execute("ALTER TABLE prompts ADD COLUMN submitter TEXT")
         except sqlite3.OperationalError:
             pass
+        try:
+            self._r.execute(
+                "ALTER TABLE responses ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._s.execute(
+                "ALTER TABLE group_members ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         self._lock = threading.Lock()
         self._sub_lock = threading.Lock()
         self._subscribers: dict[str, list[threading.Event]] = {}
 
     # ---- responses ----
-    def insert_response(self, event: dict[str, Any]) -> None:
+    def insert_response(self, event: dict[str, Any]) -> bool:
+        """Store one response event. Returns False only when a rejected event was
+        refused because a row that is NOT a rejection already holds its sequence.
+
+        **The conflict rule is deliberately asymmetric** (#885 item 3).
+
+        A genuine event keeps `INSERT OR REPLACE`, because that is load-bearing: RQ-1
+        accepts at-least-once delivery, so a redelivered frame must collapse onto one
+        row, and `emit.seed_seq` resumes numbering from the stored maximum on a cold
+        `/continue` turn — the fix for Phase 1's per-pod sequence restart. Making the
+        insert non-clobbering in general would re-open that bug under a new name.
+
+        A rejected event may create a row, and may replace a row that is itself a
+        rejection so a redelivered forgery stays idempotent, but may never replace a row
+        that is not marked rejected. Otherwise an unsigned frame reusing a sequence
+        number overwrites the verified answer at that sequence, and sequence numbers are
+        readable without signing in.
+
+        Both forms resolve the conflict in SQL rather than by raising: the caller runs
+        this outside its `try` on purpose, so a new `IntegrityError` path would end the
+        consume thread while the pod still reported healthy.
+        """
         corr     = event["correlationid"]
         sequence = int(event.get("sequence", "0"))
         phase    = event.get("phase", "stdout")
         final    = 1 if str(event.get("final", "false")).lower() == "true" else 0
+        rejected = 1 if ce.is_rejected(event) else 0
+        row = (corr, sequence, phase, event.get("id", ""), event.get("time", ""),
+               json.dumps(event.get("data")), final, json.dumps(event), rejected)
         with self._lock:
-            self._r.execute(
-                "INSERT OR REPLACE INTO responses(correlationid,sequence,phase,event_id,event_time,data_json,final,raw_json) VALUES (?,?,?,?,?,?,?,?)",
-                (corr, sequence, phase, event.get("id", ""), event.get("time", ""),
-                 json.dumps(event.get("data")), final, json.dumps(event)),
-            )
+            if rejected:
+                cur = self._r.execute(
+                    "INSERT INTO responses(correlationid,sequence,phase,event_id,event_time,data_json,final,raw_json,rejected) VALUES (?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(correlationid,sequence) DO UPDATE SET "
+                    "phase=excluded.phase, event_id=excluded.event_id, "
+                    "event_time=excluded.event_time, data_json=excluded.data_json, "
+                    "final=excluded.final, raw_json=excluded.raw_json, rejected=1 "
+                    "WHERE responses.rejected=1",
+                    row)
+                if cur.rowcount != 1:
+                    return False
+            else:
+                self._r.execute(
+                    "INSERT OR REPLACE INTO responses(correlationid,sequence,phase,event_id,event_time,data_json,final,raw_json,rejected) VALUES (?,?,?,?,?,?,?,?,?)",
+                    row)
         self._notify(corr)
+        return True
 
     def events_for(self, corr: str, since_seq: int = 0) -> list[dict[str, Any]]:
         rows = self._r.execute(
@@ -149,6 +207,15 @@ class Store:
         return [json.loads(r[0]) for r in rows]
 
     def final_seen(self, corr: str) -> bool:
+        # A rejected terminal still carries final=1, so this reports "answered" for a
+        # correlation whose only terminal event was refused. Presentational rather than
+        # state-advancing — it feeds the `"final"` field on two read endpoints and
+        # advances nothing — so it was left out of #885's scope deliberately rather
+        # than overlooked.
+        #
+        # VERIFY: once the follow-up lands, add `AND rejected=0` here and drop this
+        # comment. Keep the sentence above about why it is presentational — that is the
+        # part a maintainer acting on a vague note would delete.
         row = self._r.execute(
             "SELECT COUNT(*) FROM responses WHERE correlationid=? AND final=1", (corr,)
         ).fetchone()
@@ -317,19 +384,57 @@ class Store:
                 (_now_iso(), groupid, correlationid))
 
     def mark_member_finished(self, groupid: str, correlationid: str,
-                             terminal_phase: str) -> bool:
+                             terminal_phase: str, *, verified: bool = False) -> bool:
         """Record a member's terminal event. Returns True only on the FIRST call.
 
         `finished_utc IS NULL` makes this idempotent by construction, which is the
         whole §21.5 correction: a redelivered request re-runs the agent and emits a
         second final event, and this must not count twice.
+
+        `verified` records whether the terminal that set this row carried a signature
+        that checked out, so a later replay cannot regress it (#956,
+        `upgrade_member_terminal`). It defaults to False because most callers have no
+        verdict to offer — an unsigned deployment, or the mirror replaying history —
+        and "nothing has been proved about this row" is the truthful default.
         """
         status = "failed" if terminal_phase == "error" else "finished"
         with self._lock:
             cur = self._s.execute(
-                "UPDATE group_members SET status=?, finished_utc=?, terminal_phase=? "
+                "UPDATE group_members SET status=?, finished_utc=?, terminal_phase=?, "
+                "verified=? "
                 "WHERE groupid=? AND correlationid=? AND finished_utc IS NULL",
-                (status, _now_iso(), terminal_phase, groupid, correlationid))
+                (status, _now_iso(), terminal_phase, 1 if verified else 0,
+                 groupid, correlationid))
+            return cur.rowcount == 1
+
+    def upgrade_member_terminal(self, groupid: str, correlationid: str,
+                                terminal_phase: str) -> bool:
+        """Let a VERIFIED terminal outrank an unverified one already recorded. #956.
+
+        The replay counterpart to `mark_member_finished`, and the reason it has to
+        exist: the group mirror reads the topic rather than the store, so the
+        `ce.KEY_REJECTED` marker the live consumer writes is not available to it, and a
+        forged terminal lying earlier in the topic than the genuine answer wins the
+        `finished_utc IS NULL` race on every start. On the `test`/`kind` overlays /data
+        is an `emptyDir`, so that replay IS the state and a batch reads back
+        `failed: 1` for an agent that succeeded.
+
+        **Precedence rather than refusal, because refusal is not available here.** A
+        forged unsigned terminal and a genuine pre-signing one are byte-identical, so
+        nothing can be rejected on replay without rejecting the history the mirror
+        exists to rebuild. Instead the verdict only ever moves a member in one
+        direction — unverified to verified — which a forger cannot use, since moving a
+        member would require a valid signature from an approved key.
+
+        `verified=0` in the WHERE is what makes it one-way: a verified terminal is
+        never downgraded by a later unverified one, which is the live path's rule too.
+        """
+        status = "failed" if terminal_phase == "error" else "finished"
+        with self._lock:
+            cur = self._s.execute(
+                "UPDATE group_members SET status=?, terminal_phase=?, verified=1 "
+                "WHERE groupid=? AND correlationid=? AND verified=0",
+                (status, terminal_phase, groupid, correlationid))
             return cur.rowcount == 1
 
     def group_of(self, correlationid: str) -> str | None:
